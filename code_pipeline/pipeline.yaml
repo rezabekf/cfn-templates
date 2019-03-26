@@ -1,0 +1,248 @@
+AWSTemplateFormatVersion: 2010-09-09
+
+Parameters:
+  ServiceName:
+    Type: String
+    Default: MyRepo
+    Description: Name for this repository; used in the code repository and pipeline names
+
+  CodeBuildEnvironment:
+    Type: String
+    Default: "eb-python-3.4-amazonlinux-64:2.3.2"
+    Description: Docker image to use for CodeBuild container - Use https://amzn.to/2Aca8kJ for reference
+
+  CodeBuildVPC:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC ID that CodeBuild will use to launch temporary resource
+
+  CodeBuildPublicSubnet:
+    Type: AWS::EC2::Subnet::Id
+    Description: Public Subnet ID that CodeBuild will use to launch temporary resource
+
+  NotificationEmailAddress:
+    Type: String
+    Default: Not working - To be implemented
+    Description: Email to receive notification form CodeBuild
+
+Metadata: 
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - 
+        Label: 
+          default: "Repository Name"
+        Parameters: 
+          - ServiceName
+      -
+        Label:
+          default: "CodeBuild - Temporary Resources"
+        Parameters:
+          - CodeBuildVPC
+          - CodeBuildPublicSubnet
+
+    ParameterLabels:
+      ServiceName:
+        default: "CodeCommit repo and Pipeline name?"
+      CodeBuildVPC:
+        default: "Which VPC should I use?"
+      CodeBuildPublicSubnet:
+        default: "Which Public Subnet should I use?"
+      CodeBuildEnvironment:
+        default: "Should I use a different Docker Image?"
+      NotificationEmailAddress:
+        default: "Who should I notify upon completion?"
+
+Resources:
+  ##########
+  # Source #
+  ##########
+
+  # Code repository and S3 source for project
+  CodeRepository:
+    Type: AWS::CodeCommit::Repository
+    Properties:
+      RepositoryName: !Sub '${ServiceName}_repo'
+      RepositoryDescription: !Sub 'Repository for ${ServiceName} service'
+
+  # S3 Bucket that CodePipeline/CodeBuild service will use
+  # It will receive both SourceZip (CodeCommit Git HEAD) and BuiltZIP (CodeBuild Artifacts)
+  S3ArtifactsBucket:
+    Type: AWS::S3::Bucket
+
+  #########
+  # Build #
+  #########
+
+  CodeBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub '${ServiceName}_build'
+      ServiceRole: !Ref CodeBuildRole
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: !Sub 'aws/codebuild/${CodeBuildEnvironment}'
+        EnvironmentVariables:
+          - Name: BUILD_OUTPUT_BUCKET
+            Value: !Ref S3ArtifactsBucket
+          - Name: BUILD_VPC_ID
+            Value: !Ref CodeBuildVPC
+          - Name: BUILD_SUBNET_ID
+            Value: !Ref CodeBuildPublicSubnet
+      Source:
+        Type: CODEPIPELINE
+      TimeoutInMinutes: 10
+
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/PowerUserAccess
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Action: ['sts:AssumeRole']
+            Effect: Allow
+            Principal:
+              Service: [codebuild.amazonaws.com]
+      Policies:
+        - PolicyName: CodeBuildAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: AllowCloudWatchLogs
+                Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource:
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${ServiceName}_build'
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${ServiceName}_build:*'
+              - Sid: AllowS3ArtifactRepo
+                Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                  - 's3:GetObjectVersion'
+                  - 's3:PutObject'
+                Resource: !Sub 'arn:aws:s3:::${S3ArtifactsBucket}/*'
+
+  #############
+  # Pipeline  #
+  #############
+
+  PipelineExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Action: ['sts:AssumeRole']
+            Effect: Allow
+            Principal:
+              Service: [codepipeline.amazonaws.com]
+      Policies:
+        - PolicyName: CodePipelinePassRoleAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              Effect: Allow
+              Action: 'iam:PassRole'
+              Resource: !GetAtt CodeBuildRole.Arn
+
+        - PolicyName: CodePipelineS3ArtifactAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              Effect: Allow
+              Action:
+                - 's3:GetObject'
+                - 's3:GetObjectVersion'
+                - 's3:GetBucketVersioning'
+                - 's3:PutObject'
+              Resource:
+                - !Sub 'arn:aws:s3:::${S3ArtifactsBucket}'
+                - !Sub 'arn:aws:s3:::${S3ArtifactsBucket}/*'
+
+        - PolicyName: CodePipelineGitRepoAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              Effect: Allow
+              Action:
+                - 'codecommit:GetBranch'
+                - 'codecommit:GetCommit'
+                - 'codecommit:UploadArchive'
+                - 'codecommit:GetUploadArchiveStatus'
+                - 'codecommit:CancelUploadArchive'
+              Resource: !GetAtt CodeRepository.Arn
+
+        - PolicyName: CodePipelineBuildAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              Effect: Allow
+              Action:
+                - 'codebuild:StartBuild'
+                - 'codebuild:StopBuild'
+                - 'codebuild:BatchGetBuilds'
+              Resource: !GetAtt CodeBuildProject.Arn
+
+  Pipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      ArtifactStore:
+          Location: !Ref S3ArtifactsBucket
+          Type: S3
+      Name: !Sub ${ServiceName}_pipeline
+      RoleArn: !GetAtt PipelineExecutionRole.Arn
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: CodeCommitRepo
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: CodeCommit
+                Version: 1
+              Configuration:
+                RepositoryName: !Sub '${ServiceName}_repo'
+                BranchName: master
+              OutputArtifacts:
+                - Name: SourceZip
+              RunOrder: 1
+
+        - Name: Build
+          Actions:
+            - Name: CodeBuild
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: 1
+              Configuration:
+                ProjectName: !Ref CodeBuildProject
+              InputArtifacts:
+                - Name: SourceZip
+              OutputArtifacts:
+                - Name: BuiltZip
+
+Outputs:
+  GitRepository:
+    Description: Git repository HTTPS URL
+    Value: !GetAtt CodeRepository.CloneUrlHttp
+
+  ArtifactRepository:
+    Description: S3 Bucket for Pipeline and Build Artifacts
+    Value: !Ref S3ArtifactsBucket
+
+  CodeBuildServiceRole:
+    Description: CodeBuild IAM Service Role
+    Value: !GetAtt CodeBuildRole.Arn
+
+  CodePipelineServiceRole:
+    Description: CodePipeline IAM Service Role
+    Value: !GetAtt PipelineExecutionRole.Arn
